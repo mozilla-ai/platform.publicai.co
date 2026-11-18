@@ -1,0 +1,64 @@
+# Otari with the Public AI overlay, its database, and OpenWebUI as chat.publicai.co runs it.
+# Lago runs from its own compose file; see README.md.
+services:
+  otari-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: otari
+      POSTGRES_PASSWORD: otari
+      POSTGRES_DB: otari
+    volumes:
+      - otari_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "otari"]
+      interval: 2s
+      retries: 30
+
+  # Catches the signup and verification mail Otari sends, so signup runs end to end locally.
+  mailpit:
+    image: axllent/mailpit:v1.27
+    ports:
+      - "8025:8025"
+
+  otari:
+    image: mzdotai/otari:${OTARI_VERSION:-0.51.0}
+    depends_on:
+      otari-db:
+        condition: service_healthy
+    ports:
+      - "8100:8000"
+    environment:
+      OTARI_CONFIG_PATH: /config/config.yml
+      OTARI_BOOTSTRAP: otari_publicai:register
+      PYTHONPATH: /overlay
+      OTARI_MASTER_KEY: ${OTARI_MASTER_KEY:?set OTARI_MASTER_KEY in .env}
+      OTARI_SECRET_KEY: ${OTARI_SECRET_KEY:?set OTARI_SECRET_KEY in .env}
+      OTARI_AI_API_KEY: ${OTARI_AI_API_KEY:?set OTARI_AI_API_KEY in .env}
+      LAGO_API_BASE: ${LAGO_API_BASE:-http://host.docker.internal:3000}
+      LAGO_API_KEY: ${LAGO_API_KEY:?set LAGO_API_KEY in .env}
+      PUBLICAI_TOPUP_URL: ${PUBLICAI_TOPUP_URL:-http://localhost:3001/account/billing}
+    volumes:
+      - ./config.yml:/config/config.yml:ro
+      - ./overlay:/overlay:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    depends_on:
+      - otari
+    ports:
+      - "8180:8080"
+    environment:
+      # One service key for the whole chat app; each chat user is an end user of it.
+      OPENAI_API_BASE_URL: http://otari:8000/api/v1
+      OPENAI_API_KEY: ${OTARI_CHAT_SERVICE_KEY:-set-after-bootstrap}
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_FORWARD_USER_INFO_HEADERS: "true"
+      WEBUI_AUTH: "true"
+    volumes:
+      - open_webui:/app/backend/data
+
+volumes:
+  otari_db:
+  open_webui:

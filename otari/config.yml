@@ -1,0 +1,43 @@
+# Otari in place of Zuplo and LiteLLM for the Public AI Inference Utility (prototype).
+#
+# Zuplo's job (keys, plan rate limits, the wallet gate) and LiteLLM's (model routing, cost) are
+# both Otari's here. The Lago wallet is the overlay in ./overlay, loaded by OTARI_BOOTSTRAP.
+
+master_key: ${OTARI_MASTER_KEY}
+database_url: postgresql://otari:otari@otari-db:5432/otari
+public_base_url: http://localhost:8100
+
+# Every developer who signs up gets an organization of their own, and so a Lago wallet of their
+# own with the starter credit (the Zuplo consumer and Lago customer of today).
+open_signup: true
+
+# Signup mails a verification link. Mailpit catches it locally (http://localhost:8025).
+mail_transport: smtp
+smtp_host: mailpit
+smtp_port: 1025
+smtp_tls: false
+mail_from_email: noreply@publicai.example
+
+# The models. Public AI runs about 40 entries in LiteLLM's model_list across Infomaniak,
+# Phoeniqs, Featherless, Mistral and others. Here otari.ai serves them on one key, Apertus
+# included once otari.ai offers it through Infomaniak. A host Public AI keeps a contract with
+# directly is one more entry, e.g.:
+#   infomaniak:
+#     provider: openai
+#     api_base: https://api.infomaniak.com/2/ai/<product_id>/openai/v1
+#     api_key: ${INFOMANIAK_API_KEY}
+hosted_providers:
+  otari-ai:
+    provider: otari
+    api_key: ${OTARI_AI_API_KEY}
+    api_base: https://api.otari.ai
+
+# Zuplo's per-plan limits (user-rate-limiter.ts). Every key starts on the free plan's 100 a minute.
+# OpenWebUI's users are end users of one service key, each with a limit of their own.
+rate_limits:
+  - name: free-plan
+    per: key
+    rpm: 100
+  - name: chat-users
+    per: user
+    rpm: 30
