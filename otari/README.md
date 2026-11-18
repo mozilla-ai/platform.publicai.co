@@ -1,36 +1,18 @@
-# Otari in place of Zuplo and LiteLLM (prototype)
+# Otari prototype
 
-This directory runs the Public AI Inference Utility's API path on [Otari](https://github.com/mozilla-ai/otari)
-instead of Zuplo in front of LiteLLM. One Otari process takes over both:
+Runs Public AI's API on [Otari](https://github.com/mozilla-ai/otari) instead of Zuplo and LiteLLM.
+Overview and status: [mozilla-ai/publicai-otari-pilot](https://github.com/mozilla-ai/publicai-otari-pilot).
 
-| Today | With Otari |
-|---|---|
-| Zuplo API keys, Auth0 sign-in | Otari signup (open signup: one organization per developer) and keys from `/api/v1/organizations/me/keys` or the dashboard |
-| Zuplo per-plan rate limits (`user-rate-limiter.ts`) | The overlay's plans: free 100, plus 200, pro 300, enterprise 10,000 requests a minute per user, refused with `429` |
-| Zuplo wallet gate on Lago (`set-litellm-headers.ts`), `402` at $0.10 | The overlay: Otari's `BillingPort` bound to a Lago wallet, `402 insufficient_funds` with the top-up link |
-| Zuplo top-ups (`wallet-topup*.ts`, `customer-checkout-url-handler.ts`) | The overlay's wallet routes: save a card through Lago's Stripe checkout, buy credit, Lago invoices it |
-| LiteLLM `model_list` across Infomaniak, Phoeniqs, Featherless, Mistral, ... | Otari hosted providers. Here every model comes through otari.ai on one key; the Helm chart in the chat repo lists Public AI's own hosts |
-| LiteLLM cost per request, read back for billing (`billing-handler.ts`) | Otari prices each request (`usage.cost_usd`, `Otari-Cost-USD`) and charges the wallet as it settles |
-| LiteLLM `custom_lago_callback.py` (token events per model) | Not needed: the wallet is charged in dollars, so Lago keeps no per-model price list |
-| LiteLLM `custom_auth.py` (OpenWebUI users get the `public_ai_free` budget) | One Otari service key for OpenWebUI; each chat user is an end user of it on the `public_ai_free` budget. Needs the `otari_end_user` filter from the chat repo's `community/owui_functions/` |
+- `overlay/`: plugin that connects Otari to Lago wallets and Public AI's plans. Loaded with
+  `OTARI_BOOTSTRAP=otari_publicai:register`.
+- `docker-compose.yml`: Otari, Postgres, Redis, Mailpit, OpenWebUI.
+- `Dockerfile`: Otari image with the overlay, used by the Helm chart.
+- `scripts/bootstrap.py`: first-time setup.
+- `scripts/smoke.py`: end-to-end test.
 
-The overlay is loaded with `OTARI_BOOTSTRAP=otari_publicai:register` and needs no change to Otari
-itself. It is the same extension point otari.ai's own wallet uses. Its state shared between Otari
-replicas (wallet holds, charges not yet sent to Lago, a 20-second balance cache) is in Redis.
+## Run
 
-## Overlay routes
-
-| Route | Who | What |
-|---|---|---|
-| `GET /api/v1/wallet` | developer | balance, held amount, plan and its limit |
-| `GET /api/v1/wallet/checkout` | developer | Lago's Stripe link to save a card (`null` without Stripe) |
-| `POST /api/v1/wallet/top-ups` | developer | buy $5 to $1,000 of credit; lands when Lago's invoice is paid |
-| `POST /api/v1/wallet/grants` | operator | add free credit |
-| `PUT /api/v1/wallet/plan` | operator | move an organization to `free`, `plus`, `pro` or `enterprise` |
-
-## Run it
-
-Lago runs from its own compose file:
+Start Lago from its own repo:
 
 ```bash
 git clone https://github.com/getlago/lago.git && cd lago
@@ -39,51 +21,37 @@ git clone https://github.com/getlago/lago.git && cd lago
 docker compose up -d
 ```
 
-Then, from this directory:
+Then from this directory:
 
 ```bash
-cp .env.example .env            # fill in OTARI_SECRET_KEY and OTARI_AI_API_KEY (an otari.ai key)
+cp .env.example .env            # set OTARI_SECRET_KEY and OTARI_AI_API_KEY (an otari.ai key)
 docker compose up -d otari
-python3 scripts/bootstrap.py    # operator org, otari.ai models, chat budget and service key
-docker compose up -d open-webui # http://localhost:8180; install the otari_end_user filter as a global filter
-docker compose run -d --name otari-replica-2 -p 8101:8000 otari   # optional second replica
+python3 scripts/bootstrap.py
+docker compose up -d open-webui # add the otari_end_user filter as a global filter
+docker compose run -d --name otari-replica-2 -p 8101:8000 otari   # optional second server
 python3 scripts/smoke.py
 ```
 
-`Dockerfile` builds the image the Helm chart runs: Otari with the overlay in it.
-
 | Service | URL |
 |---|---|
-| Otari API and dashboard | http://localhost:8100 |
+| Otari | http://localhost:8100 |
 | OpenWebUI | http://localhost:8180 |
-| Mailpit (signup mail) | http://localhost:8025 |
-| Lago | http://localhost:8081 (API on :3000) |
+| Mailpit | http://localhost:8025 |
+| Lago | http://localhost:8081 (API :3000) |
 
-`scripts/smoke.py` walks a developer through the whole path and checks each step: sign up and
-verify by mail, create a key, see the $2 starter credit, chat (served through otari.ai, charged to
-the wallet), drain the wallet and get `402` with the top-up link, get credit and be served again,
-buy credit (the Lago invoice is marked paid by hand, as Stripe's webhook would), share the wallet
-with a second replica, and hit the plan's limit (`429`).
+## Wallet routes
 
-## Models
+| Route | Who | Does |
+|---|---|---|
+| `GET /api/v1/wallet` | developer | balance, plan, limit |
+| `GET /api/v1/wallet/checkout` | developer | Stripe link to save a card |
+| `POST /api/v1/wallet/top-ups` | developer | buy $5 to $1,000 of credit |
+| `POST /api/v1/wallet/grants` | operator | add free credit |
+| `PUT /api/v1/wallet/plan` | operator | set `free`, `plus`, `pro` or `enterprise` |
 
-Model ids are Public AI's (`mistralai/mistral-small-4`, `z-ai/glm-5.2`, ...): Otari picks the
-provider for a `vendor/model` id. Apertus (`swiss-ai/apertus-v1.5-70b`) is not on otari.ai yet,
-so the smoke script skips it. Public AI can serve it today by adding its Infomaniak account as a
-hosted provider, as the commented block in `config.yml` shows.
+## Notes
 
-Right after `bootstrap.py` loads otari.ai's models, bare `vendor/model` ids can take up to a
-minute to resolve (`otari-ai:vendor/model` works at once). A fix in Otari is ready on the branch
-`fix/hosted-refresh-catalog-ids`.
-
-## Known gaps
-
-- **Usage invoices.** A charge voids wallet credits rather than sending a Lago usage event, so Lago
-  invoices top-ups but not usage. Otari keeps the per-request usage rows.
-- **One write to Otari's tables.** Putting a user on their plan sets `users.budget_id` directly,
-  because Otari's operator user routes only reach the operator's own organization. Otari limits
-  requests per minute on a user's own budget and not on an organization ceiling.
-- **Plans and Zuplo plans.** Plans are set by an operator (`PUT /api/v1/wallet/plan`). The Plus
-  upgrade through OpenCollective is not wired up.
-- **Developer portal.** The Zudoku portal in this repository still talks to Zuplo's key service;
-  pointing its API key and billing pages at Otari's routes is not done here.
+- Models come from otari.ai. Apertus isn't there yet; `config.yml` has a commented Infomaniak
+  block to add it directly.
+- Setting a user's plan writes `users.budget_id` in Otari's database directly, because Otari's
+  API can't do it for another organization's users.
