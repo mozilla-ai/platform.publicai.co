@@ -14,6 +14,10 @@ services:
       interval: 2s
       retries: 30
 
+  # Shared by every Otari replica: rate-limit counts, and the overlay's wallet holds.
+  redis:
+    image: redis:7-alpine
+
   # Catches the signup and verification mail Otari sends, so signup runs end to end locally.
   mailpit:
     image: axllent/mailpit:v1.27
@@ -25,6 +29,8 @@ services:
     depends_on:
       otari-db:
         condition: service_healthy
+      redis:
+        condition: service_started
     ports:
       - "8100:8000"
     environment:
@@ -34,6 +40,8 @@ services:
       OTARI_MASTER_KEY: ${OTARI_MASTER_KEY:?set OTARI_MASTER_KEY in .env}
       OTARI_SECRET_KEY: ${OTARI_SECRET_KEY:?set OTARI_SECRET_KEY in .env}
       OTARI_AI_API_KEY: ${OTARI_AI_API_KEY:?set OTARI_AI_API_KEY in .env}
+      PUBLICAI_REDIS_URL: redis://redis:6379/1
+      STRIPE_PAYMENT_PROVIDER_CODE: ${STRIPE_PAYMENT_PROVIDER_CODE:-}
       LAGO_API_BASE: ${LAGO_API_BASE:-http://host.docker.internal:3000}
       LAGO_API_KEY: ${LAGO_API_KEY:?set LAGO_API_KEY in .env}
       PUBLICAI_TOPUP_URL: ${PUBLICAI_TOPUP_URL:-http://localhost:3001/account/billing}

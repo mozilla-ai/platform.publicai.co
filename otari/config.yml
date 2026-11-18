@@ -32,12 +32,14 @@ hosted_providers:
     api_key: ${OTARI_AI_API_KEY}
     api_base: https://api.otari.ai
 
-# Zuplo's per-plan limits (user-rate-limiter.ts). Every key starts on the free plan's 100 a minute.
-# OpenWebUI's users are end users of one service key, each with a limit of their own.
+# Counted in Redis, so the limits hold across Otari replicas.
+rate_limit_store: redis
+rate_limit_redis_url: redis://redis:6379/0
+
+# Zuplo's per-plan limits (user-rate-limiter.ts) are budgets the overlay puts each organization on
+# (overlay/otari_publicai/plans.py): free 100, plus 200, pro 300, enterprise 10,000 requests a
+# minute per user. OpenWebUI's users are end users of one service key, each with a limit of their own.
 rate_limits:
-  - name: free-plan
-    per: key
-    rpm: 100
   - name: chat-users
     per: user
     rpm: 30

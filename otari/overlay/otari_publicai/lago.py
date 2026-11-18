@@ -33,8 +33,26 @@ class Lago:
         return response.json() if response.content else {}
 
     async def ensure_customer(self, external_id: str, name: str) -> None:
-        if await self._call("GET", f"/customers/{external_id}") is None:
-            await self._call("POST", "/customers", json={"customer": {"external_id": external_id, "name": name}})
+        if await self._call("GET", f"/customers/{external_id}") is not None:
+            return
+        customer: dict[str, Any] = {"external_id": external_id, "name": name}
+        if provider_code := os.environ.get("STRIPE_PAYMENT_PROVIDER_CODE"):
+            # As Public AI's customer-provisioning.ts does: Lago creates the Stripe customer.
+            customer["billing_configuration"] = {
+                "payment_provider": "stripe",
+                "payment_provider_code": provider_code,
+                "sync_with_provider": True,
+            }
+        await self._call("POST", "/customers", json={"customer": customer})
+
+    async def checkout_url(self, external_id: str) -> str | None:
+        """Lago's link for saving a card with the customer's payment provider."""
+        try:
+            body = await self._call("GET", f"/customers/{external_id}/checkout_url")
+        except LagoError:
+            # Answered when the customer has no payment provider.
+            return None
+        return ((body or {}).get("customer") or {}).get("checkout_url")
 
     async def active_wallet(self, external_id: str) -> dict[str, Any] | None:
         body = await self._call("GET", "/wallets", params={"external_customer_id": external_id})
@@ -57,13 +75,24 @@ class Lago:
         )
         return (body or {})["wallet"]
 
-    async def transact(self, wallet_id: str, *, granted: Decimal = Decimal(0), voided: Decimal = Decimal(0)) -> None:
+    async def transact(
+        self,
+        wallet_id: str,
+        *,
+        granted: Decimal = Decimal(0),
+        paid: Decimal = Decimal(0),
+        voided: Decimal = Decimal(0),
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        """Add or remove credits. Paid credits are invoiced and land once the invoice is paid."""
         transaction: dict[str, str] = {"wallet_id": wallet_id}
-        if granted:
-            transaction["granted_credits"] = str(granted.quantize(CREDIT_PLACES))
-        if voided:
-            transaction["voided_credits"] = str(voided.quantize(CREDIT_PLACES))
-        await self._call("POST", "/wallet_transactions", json={"wallet_transaction": transaction})
+        for field_name, amount in (("granted_credits", granted), ("paid_credits", paid), ("voided_credits", voided)):
+            if amount:
+                transaction[field_name] = str(amount.quantize(CREDIT_PLACES))
+        if name:
+            transaction["name"] = name
+        body = await self._call("POST", "/wallet_transactions", json={"wallet_transaction": transaction})
+        return ((body or {}).get("wallet_transactions") or [{}])[0]
 
 
 def balance_of(wallet: dict[str, Any]) -> Decimal:

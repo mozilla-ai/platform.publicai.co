@@ -18,6 +18,7 @@ from decimal import Decimal
 from pathlib import Path
 
 OTARI = os.environ.get("OTARI_URL", "http://localhost:8100")
+OTARI_REPLICA = os.environ.get("OTARI_REPLICA_URL", "http://localhost:8101")
 MAILPIT = os.environ.get("MAILPIT_URL", "http://localhost:8025")
 LAGO = os.environ.get("LAGO_URL", "http://localhost:3000")
 MODEL = os.environ.get("SMOKE_MODEL", "mistralai/mistral-small-4")
@@ -137,19 +138,52 @@ def main() -> None:
     status, _, body = chat(key, MODEL)
     check(status == 200, f"served again ({status})")
 
-    # The free-plan rule is in config.yml and so read-only at runtime; a stricter per-key rule
-    # added for this step shows the same refusal without a hundred requests.
-    step("A per-key rate limit refuses with 429 (a temporary rule of 2 a minute)")
-    status, _, body = call("POST", f"{OTARI}/api/v1/organizations/me/keys", {"key_name": "smoke-rate-limit"})
-    fresh_key = body["key"]
-    status, _, body = call("POST", f"{OTARI}/api/v1/rate-limits", {"name": "smoke-tight", "per": "key", "rpm": 2}, master)
-    check(status < 300, f"temporary rule added ({status})")
+    step("The developer buys $5 of credit; it lands once Lago's invoice is paid")
+    lago_auth = {"Authorization": f"Bearer {ENV['LAGO_API_KEY']}"}
+    before = Decimal(call("GET", f"{OTARI}/api/v1/wallet")[2]["balance_usd"])
+    status, _, body = call("POST", f"{OTARI}/api/v1/wallet/top-ups", {"amount_usd": "5"})
+    check(status == 202, f"top-up started ({status}): {body}")
+    for _ in range(15):  # Lago writes the invoice in a background job
+        invoices = call("GET", f"{LAGO}/api/v1/invoices?external_customer_id={organization_id}", headers=lago_auth)[2]["invoices"]
+        if invoices:
+            break
+        time.sleep(1)
+    check(bool(invoices), f"Lago invoiced it: {invoices[0]['total_amount_cents'] if invoices else None} cents, {invoices[0]['payment_status'] if invoices else ''}")
+    # Without Stripe connected, mark the invoice paid by hand, as Stripe's webhook would.
+    call("PUT", f"{LAGO}/api/v1/invoices/{invoices[0]['lago_id']}", {"invoice": {"payment_status": "succeeded"}}, lago_auth)
+    for _ in range(12):
+        time.sleep(5)
+        after = Decimal(call("GET", f"{OTARI}/api/v1/wallet")[2]["balance_usd"])
+        if after >= before + 5:
+            break
+    check(after >= before + 5, f"balance ${before} -> ${after}")
+
+    if call("GET", f"{OTARI_REPLICA}/api/v1/health")[0] == 200:
+        step("A second Otari replica shares the wallet")
+        status, _, body = call("POST", f"{OTARI_REPLICA}/api/v1/chat/completions", {"model": MODEL, "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 5}, {"Authorization": f"Bearer {key}"})
+        check(status == 200, f"served by the replica, cost ${body['usage'].get('cost_usd') if status == 200 else body}")
+        first = call("GET", f"{OTARI}/api/v1/wallet")[2]
+        second = call("GET", f"{OTARI_REPLICA}/api/v1/wallet")[2]
+        check(first["balance_usd"] == second["balance_usd"] and Decimal(first["balance_usd"]) < after, f"both replicas read ${first['balance_usd']}")
+    else:
+        print(f"\n== skip: no second replica at {OTARI_REPLICA}")
+
+    step("The developer is on the free plan, and its limit refuses with 429")
+    wallet = call("GET", f"{OTARI}/api/v1/wallet")[2]
+    check(wallet["plan"] == "free" and wallet["requests_per_minute"] == 100, f"plan {wallet['plan']}, {wallet['requests_per_minute']} a minute")
+    status, _, body = call("PUT", f"{OTARI}/api/v1/wallet/plan", {"organization_id": organization_id, "plan": "pro"}, master)
+    check(status == 200 and body["plan"] == "pro", f"an operator moves it to pro: {body['requests_per_minute']} a minute")
+    # A hundred requests is too many for a smoke test, so the plan's budget is tightened to 2 a
+    # minute for this step: the same limit, enforced the same way.
+    plan_budget = f"{OTARI}/api/v1/budgets/plan-{organization_id}"
+    call("PUT", plan_budget, {"name": "Plan: pro", "rpm_limit": 2}, master)
     try:
-        results = [chat(fresh_key, MODEL, "Reply with one word.") for _ in range(3)]
+        time.sleep(61)  # a fresh minute, so earlier requests do not count
+        results = [chat(key, MODEL, "Reply with one word.") for _ in range(3)]
     finally:
-        call("DELETE", f"{OTARI}/api/v1/rate-limits/smoke-tight", headers=master)
+        call("PUT", f"{OTARI}/api/v1/wallet/plan", {"organization_id": organization_id, "plan": "free"}, master)
     statuses = [status for status, _, _ in results]
-    check(statuses == [200, 200, 429], f"statuses {statuses}, Retry-After={results[-1][1].get('Retry-After')}")
+    check(statuses == [200, 200, 429], f"statuses {statuses}: {results[-1][2] if statuses[-1] != 200 else ''}")
 
     print("\nAll steps passed.")
 
