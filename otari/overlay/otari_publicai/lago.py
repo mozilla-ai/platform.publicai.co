@@ -1,6 +1,8 @@
 """A small async client for the parts of Lago's API the wallet uses."""
 
 import os
+import time
+import uuid
 from decimal import Decimal
 from typing import Any
 
@@ -8,6 +10,9 @@ import httpx
 
 # Lago keeps wallet credits to five decimal places.
 CREDIT_PLACES = Decimal("0.00001")
+# Public AI's plan and billable metric, from charts/platform/lago-catalog.yaml.
+PLAN_CODE = os.environ.get("LAGO_PLAN_CODE", "pay_as_you_go")
+EVENT_CODE = os.environ.get("LAGO_API_EVENT_CODE", "public_ai_models")
 
 
 class LagoError(Exception):
@@ -45,6 +50,27 @@ class Lago:
             }
         await self._call("POST", "/customers", json={"customer": customer})
 
+    async def ensure_subscription(self, external_id: str) -> None:
+        """Put the customer on the pay-as-you-go plan, as ``customer-provisioning.ts`` does."""
+        body = await self._call(
+            "GET", "/subscriptions", params={"external_customer_id": external_id, "status[]": "active"}
+        )
+        if (body or {}).get("subscriptions"):
+            return
+        subscription = {"external_customer_id": external_id, "external_id": external_id, "plan_code": PLAN_CODE}
+        await self._call("POST", "/subscriptions", json={"subscription": subscription})
+
+    async def send_tokens(self, subscription_id: str, model: str, tokens: int, kind: str) -> None:
+        """One token event, shaped as LiteLLM's ``custom_lago_callback.py`` sends it."""
+        event = {
+            "transaction_id": str(uuid.uuid4()),
+            "external_subscription_id": subscription_id,
+            "code": EVENT_CODE,
+            "timestamp": int(time.time()),
+            "properties": {"tokens": tokens, "model": model, "type": kind},
+        }
+        await self._call("POST", "/events", json={"event": event})
+
     async def checkout_url(self, external_id: str) -> str | None:
         """Lago's link for saving a card with the customer's payment provider."""
         try:
@@ -66,10 +92,11 @@ class Lago:
             json={
                 "wallet": {
                     "external_customer_id": external_id,
-                    "name": "Credits",
+                    "name": "Prepaid Credits",
                     "currency": "USD",
-                    "rate_amount": "1",
+                    "rate_amount": "1.0",
                     "granted_credits": str(granted),
+                    "transaction_name": "Welcome to Public AI!",
                 }
             },
         )
@@ -96,5 +123,8 @@ class Lago:
 
 
 def balance_of(wallet: dict[str, Any]) -> Decimal:
-    """The credits a wallet holds, one credit to the dollar."""
-    return Decimal(str(wallet.get("credits_balance") or "0"))
+    """The credits a wallet holds less usage not yet invoiced, one credit to the dollar.
+
+    The balance Zuplo's ``set-litellm-headers.ts`` gates on.
+    """
+    return Decimal(str(wallet.get("credits_ongoing_balance") or wallet.get("credits_balance") or "0"))

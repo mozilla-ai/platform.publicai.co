@@ -109,8 +109,18 @@ def main() -> None:
     status, headers, body = chat(key, MODEL)
     check(status == 200, f"{status}: {body if status != 200 else body['choices'][0]['message']['content']!r}")
     print(f"       Otari-Provider={headers.get('Otari-Provider')} Otari-Model={headers.get('Otari-Model')} cost=${body['usage'].get('cost_usd')}")
-    status, _, wallet = call("GET", f"{OTARI}/api/v1/wallet")
-    check(Decimal(wallet["balance_usd"]) < starting, f"the wallet was charged: ${starting} -> ${wallet['balance_usd']}")
+    # Otari sends Lago the token events LiteLLM's callback sent; Lago prices them from the catalog
+    # and deducts the wallet once the usage adds up to a cent.
+    lago_auth = {"Authorization": f"Bearer {ENV['LAGO_API_KEY']}"}
+    rows: list[str] = []
+    for _ in range(30):
+        time.sleep(2)
+        usage = call("GET", f"{LAGO}/api/v1/customers/{organization_id}/current_usage?external_subscription_id={organization_id}", headers=lago_auth)[2]
+        charges = (usage or {}).get("customer_usage", {}).get("charges_usage", [])
+        rows = [f"{f['values']['model'][0]} {f['values']['type'][0]} {f['units']}" for c in charges for f in c.get("filters", []) if Decimal(f["units"]) > 0]
+        if len(rows) == 2:
+            break
+    check(len(rows) == 2, "Lago usage per model, as the portal shows it: " + "; ".join(rows))
 
     step(f"Apertus ({APERTUS})")
     status, headers, body = chat(key, APERTUS)
@@ -139,12 +149,11 @@ def main() -> None:
     check(status == 200, f"served again ({status})")
 
     step("The developer buys $5 of credit; it lands once Lago's invoice is paid")
-    lago_auth = {"Authorization": f"Bearer {ENV['LAGO_API_KEY']}"}
     before = Decimal(call("GET", f"{OTARI}/api/v1/wallet")[2]["balance_usd"])
     status, _, body = call("POST", f"{OTARI}/api/v1/wallet/top-ups", {"amount_usd": "5"})
     check(status == 202, f"top-up started ({status}): {body}")
     for _ in range(15):  # Lago writes the invoice in a background job
-        invoices = call("GET", f"{LAGO}/api/v1/invoices?external_customer_id={organization_id}", headers=lago_auth)[2]["invoices"]
+        invoices = [i for i in call("GET", f"{LAGO}/api/v1/invoices?external_customer_id={organization_id}", headers=lago_auth)[2]["invoices"] if i["invoice_type"] == "credit"]
         if invoices:
             break
         time.sleep(1)

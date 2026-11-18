@@ -1,13 +1,12 @@
 """Otari's ``BillingPort`` on a Lago prepaid wallet, one wallet per Otari organization.
 
-This replaces the wallet gate in Zuplo's ``set-litellm-headers.ts`` and the token events of
-LiteLLM's ``custom_lago_callback.py``. Otari prices each request itself and hands the settled
-dollar amount to :meth:`LagoBillingAdapter.charge`, so Lago no longer needs a per-model price
-list: a charge voids that many credits from the wallet. Lago therefore invoices top-ups, and
-Otari's usage rows say what each request cost.
+This replaces the wallet gate in Zuplo's ``set-litellm-headers.ts``: it provisions the same
+customer, wallet and pay-as-you-go subscription, and refuses on the same ongoing balance. Lago
+prices the request from the token events ``usage.py`` sends, as LiteLLM's callback did, and
+deducts the wallet itself.
 
-Holds, unvoided charges and the cached balance are in Redis (``ledger.py``), so any number of
-Otari replicas share one view of each wallet.
+Holds and the cached balance are in Redis (``ledger.py``), so any number of Otari replicas share
+one view of each wallet.
 """
 
 import asyncio
@@ -15,12 +14,12 @@ import logging
 import os
 import uuid
 from collections.abc import Mapping
-from decimal import ROUND_DOWN, Decimal
+from decimal import Decimal
 
 from gateway.ports.billing_port import BilledModel, BillingPort, InsufficientFundsError, ToolUse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from otari_publicai.lago import CREDIT_PLACES, Lago, LagoError, balance_of
+from otari_publicai.lago import Lago, LagoError, balance_of
 from otari_publicai.ledger import Ledger
 from otari_publicai import plans
 
@@ -67,8 +66,8 @@ async def _lago_balance(organization_id: uuid.UUID) -> Decimal:
 
 
 async def available(organization_id: uuid.UUID) -> Decimal:
-    """The wallet's balance less what has been charged and not yet voided in Lago."""
-    return await _lago_balance(organization_id) - await ledger().owed(organization_id)
+    """The wallet's ongoing balance, lowered by charges Lago has not counted yet."""
+    return await _lago_balance(organization_id)
 
 
 async def held(organization_id: uuid.UUID) -> Decimal:
@@ -151,6 +150,7 @@ class LagoBillingAdapter(BillingPort):
         external_id = str(organization_id)
         try:
             await lago().ensure_customer(external_id, name=f"Otari organization {external_id}")
+            await lago().ensure_subscription(external_id)
             wallet = await lago().active_wallet(external_id)
             if wallet is None:
                 wallet = await lago().create_wallet(external_id, granted=STARTER_CREDIT)
@@ -218,32 +218,6 @@ class LagoBillingAdapter(BillingPort):
     ) -> None:
         if amount <= 0:
             return
-        # Counted against the balance at once; voided in Lago below, or by a later charge.
-        await ledger().add_owed(organization_id, amount)
-        if await ledger().lock_voiding(organization_id):
-            try:
-                await self._void_owed(organization_id)
-            except (LagoError, OSError) as exc:
-                logger.warning("Lago charge of %s failed for %s: %s", amount, organization_id, exc)
-            finally:
-                await ledger().unlock_voiding(organization_id)
-        logger.info(
-            "charged %s to %s for %s (%s)",
-            amount,
-            organization_id,
-            f"{billed.provider}:{billed.model}" if billed else "tools",
-            description or "",
-        )
-
-    async def _void_owed(self, organization_id: uuid.UUID) -> None:
-        wallet_id = await ledger().wallet_id(organization_id)
-        if wallet_id is None:
-            return
-        owed = await ledger().owed(organization_id)
-        # Lago takes whole credit steps, and no more than the wallet holds.
-        voided = min(owed, await _lago_balance(organization_id)).quantize(CREDIT_PLACES, rounding=ROUND_DOWN)
-        if voided <= 0:
-            return
-        await lago().transact(wallet_id, voided=voided, name="Usage")
-        await ledger().settle_owed(organization_id, voided)
-        await ledger().lower_cached_balance(organization_id, voided)
+        # Lago deducts it once it has priced the token events; until the balance is read again,
+        # count it here so back-to-back requests do not all pass on the same cached balance.
+        await ledger().lower_cached_balance(organization_id, amount)

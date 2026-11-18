@@ -45,6 +45,8 @@ services:
       LAGO_API_BASE: ${LAGO_API_BASE:-http://host.docker.internal:3000}
       LAGO_API_KEY: ${LAGO_API_KEY:?set LAGO_API_KEY in .env}
       PUBLICAI_TOPUP_URL: ${PUBLICAI_TOPUP_URL:-http://localhost:3001/account/billing}
+      # Served model -> Public AI's Lago catalog name. otari.ai's model ids are not in the catalog.
+      PUBLICAI_LAGO_MODELS: ${PUBLICAI_LAGO_MODELS:-mistralai/mistral-small-4=mistralai/mistral-small-2603}
     volumes:
       - ./config.yml:/config/config.yml:ro
       - ./overlay:/overlay:ro
